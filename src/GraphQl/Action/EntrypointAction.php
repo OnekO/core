@@ -17,17 +17,15 @@ use ApiPlatform\Core\GraphQl\ExecutorInterface;
 use ApiPlatform\Core\GraphQl\Type\SchemaBuilderInterface;
 use GraphQL\Error\Debug;
 use GraphQL\Error\Error;
+use GraphQL\Error\UserError;
 use GraphQL\Executor\ExecutionResult;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
-use Symfony\Component\Serializer\Normalizer\NormalizerInterface;
 
 /**
  * GraphQL API entrypoint.
- *
- * @experimental
  *
  * @author Alan Poulain <contact@alanpoulain.eu>
  */
@@ -37,19 +35,17 @@ final class EntrypointAction
     private $executor;
     private $graphiQlAction;
     private $graphQlPlaygroundAction;
-    private $normalizer;
     private $debug;
     private $graphiqlEnabled;
     private $graphQlPlaygroundEnabled;
     private $defaultIde;
 
-    public function __construct(SchemaBuilderInterface $schemaBuilder, ExecutorInterface $executor, GraphiQlAction $graphiQlAction, GraphQlPlaygroundAction $graphQlPlaygroundAction, NormalizerInterface $normalizer, bool $debug = false, bool $graphiqlEnabled = false, bool $graphQlPlaygroundEnabled = false, $defaultIde = false)
+    public function __construct(SchemaBuilderInterface $schemaBuilder, ExecutorInterface $executor, GraphiQlAction $graphiQlAction, GraphQlPlaygroundAction $graphQlPlaygroundAction, bool $debug = false, bool $graphiqlEnabled = false, bool $graphQlPlaygroundEnabled = false, $defaultIde = false)
     {
         $this->schemaBuilder = $schemaBuilder;
         $this->executor = $executor;
         $this->graphiQlAction = $graphiQlAction;
         $this->graphQlPlaygroundAction = $graphQlPlaygroundAction;
-        $this->normalizer = $normalizer;
         $this->debug = $debug ? Debug::INCLUDE_DEBUG_MESSAGE | Debug::INCLUDE_TRACE : false;
         $this->graphiqlEnabled = $graphiqlEnabled;
         $this->graphQlPlaygroundEnabled = $graphQlPlaygroundEnabled;
@@ -58,33 +54,55 @@ final class EntrypointAction
 
     public function __invoke(Request $request): Response
     {
-        try {
-            if ($request->isMethod('GET') && 'html' === $request->getRequestFormat()) {
-                if ('graphiql' === $this->defaultIde && $this->graphiqlEnabled) {
-                    return ($this->graphiQlAction)($request);
-                }
-
-                if ('graphql-playground' === $this->defaultIde && $this->graphQlPlaygroundEnabled) {
-                    return ($this->graphQlPlaygroundAction)($request);
-                }
+        if ($request->isMethod('GET') && 'html' === $request->getRequestFormat()) {
+            if ('graphiql' === $this->defaultIde && $this->graphiqlEnabled) {
+                return ($this->graphiQlAction)($request);
             }
 
-            [$query, $operation, $variables] = $this->parseRequest($request);
-            if (null === $query) {
-                throw new BadRequestHttpException('GraphQL query is not valid.');
+            if ('graphql-playground' === $this->defaultIde && $this->graphQlPlaygroundEnabled) {
+                return ($this->graphQlPlaygroundAction)($request);
             }
-
-            $executionResult = $this->executor
-                ->executeQuery($this->schemaBuilder->getSchema(), $query, null, null, $variables, $operation)
-                ->setErrorFormatter([$this->normalizer, 'normalize']);
-        } catch (\Exception $exception) {
-            $executionResult = (new ExecutionResult(null, [new Error($exception->getMessage(), null, null, null, null, $exception)]))
-                ->setErrorFormatter([$this->normalizer, 'normalize']);
         }
 
-        return new JsonResponse($executionResult->toArray($this->debug));
+        try {
+            $requestData = $this->parseRequest($request);
+
+            if (isset($requestData['query'])) {
+                $response = $this->getQueryResult($requestData);
+            } else {
+                $response = [];
+                foreach ($requestData as $data) {
+                    $response[] = $this->getQueryResult($data);
+                }
+            }
+        } catch (BadRequestHttpException $e) {
+            $exception = new UserError($e->getMessage(), 0, $e);
+
+            return $this->buildExceptionResponse($exception, Response::HTTP_BAD_REQUEST);
+        } catch (\Exception $e) {
+            return $this->buildExceptionResponse($e, Response::HTTP_OK);
+        }
+
+        return new JsonResponse($response);
     }
 
+    /**
+     * @throws BadRequestHttpException
+     */
+    private function getQueryResult(array $data) {
+        if (null === $data['query']) {
+            throw new BadRequestHttpException('GraphQL query is not valid.');
+        }
+        $executionResult = $this->executor->executeQuery(
+            $this->schemaBuilder->getSchema(),
+            $data['query'],
+            null,
+            null,
+            $data['variables'],
+            $data['operation']
+        );
+        return $executionResult->toArray($this->debug);
+    }
     /**
      * @throws BadRequestHttpException
      */
@@ -120,10 +138,22 @@ final class EntrypointAction
      */
     private function parseData(?string $query, ?string $operation, array $variables, string $jsonContent): array
     {
-        if (!\is_array($data = json_decode($jsonContent, true))) {
+        if (!\is_array($decodedContent = json_decode($jsonContent, true))) {
             throw new BadRequestHttpException('GraphQL data is not valid JSON.');
         }
+        if (isset($decodedContent['query'])) {
+            $parsedData = $this->getParsedData($query, $operation, $variables, $decodedContent);
+        } else {
+            $parsedData = [];
+            foreach ($decodedContent as $data) {
+                $parsedData[] = $this->getParsedData($query, $operation, $variables, $data);
+            }
+        }
 
+        return $parsedData;
+    }
+
+    private function getParsedData(?string $query, ?string $operation, array $variables, array $data) {
         if (isset($data['query'])) {
             $query = $data['query'];
         }
@@ -132,11 +162,10 @@ final class EntrypointAction
             $variables = \is_array($data['variables']) ? $data['variables'] : $this->decodeVariables($data['variables']);
         }
 
-        if (isset($data['operation'])) {
-            $operation = $data['operation'];
+        if (isset($data['operationName'])) {
+            $operation = $data['operationName'];
         }
-
-        return [$query, $operation, $variables];
+        return ['query' => $query, 'operation' => $operation, 'variables' => $variables];
     }
 
     /**
@@ -144,14 +173,14 @@ final class EntrypointAction
      */
     private function parseMultipartRequest(?string $query, ?string $operation, array $variables, array $bodyParameters, array $files): array
     {
+        /** @var string $operations */
+        /** @var string $map */
         if ((null === $operations = $bodyParameters['operations'] ?? null) || (null === $map = $bodyParameters['map'] ?? null)) {
             throw new BadRequestHttpException('GraphQL multipart request does not respect the specification.');
         }
 
-        /** @var string $operations */
         [$query, $operation, $variables] = $this->parseData($query, $operation, $variables, $operations);
 
-        /** @var string $map */
         if (!\is_array($decodedMap = json_decode($map, true))) {
             throw new BadRequestHttpException('GraphQL multipart request map is not valid JSON.');
         }
@@ -209,5 +238,12 @@ final class EntrypointAction
         }
 
         return $variables;
+    }
+
+    private function buildExceptionResponse(\Exception $e, int $statusCode): JsonResponse
+    {
+        $executionResult = new ExecutionResult(null, [new Error($e->getMessage(), null, null, null, null, $e)]);
+
+        return new JsonResponse($executionResult->toArray($this->debug), $statusCode);
     }
 }
